@@ -51,4 +51,100 @@ Here are baash commands that we run in the EC2 instance.
 ```sudo pip install s3fs``` - install s3fs to interact with AWS S3 <br/>
 ```sudo pip install apache-airflow``` - install apache airflow <br/>
 ```airflow standalone``` - runs airflow <br/>
+![EC2 Instance](https://github.com/srajeevan/AWS-Python_ETL_Pipeline_using_Airflow/blob/main/images/EC2_Instance.png)
 
+We will be able to connect to airflow once we have the EC2 instance ready.
+We have the port 8080 allocated for airflow.
+An airflow UI is generated when the webserver is up and running with some pre-defined DAGs as shown below:
+
+![Airflow UI](https://github.com/srajeevan/AWS-Python_ETL_Pipeline_using_Airflow/blob/main/images/airflow_UI.png)
+
+* **Step 2** - In order for airflow to make API calls to open weather, there needs to be a connection between two services which can be done using 'connections' tab in airflow. This will allow airflow to access openweather map using HTTP operator.
+![Airflow Connection Tab](https://github.com/srajeevan/AWS-Python_ETL_Pipeline_using_Airflow/blob/main/images/Airflow_Connection.png)
+
+* **Step 3** - It is time to create our first DAG (Directed Acyclic Graph) with proper imports and dependencies. This step is subdivided into three steps each accounting for a task within our DAG. Create dag file for example weather_dag.py and add the required import and libraries:
+     * **Task 1** - Tasks are written inside the DAGs using operators. Here, we use the *HTTPSensor* Operator to check if the API is callable or not. You use your API key and choose any city in which you are interested.
+     * weather_dag is the dag we have created.We pass on the default_args that we defined in a dictionary as well.
+       At firt we check if the weather_api end point is ready or not and this is done is the is_weather_api_ready task.
+       This taks involves accessing the api endpoint by passing the API key and the city.
+
+```
+with DAG('weather_dag',
+        default_args=default_args,
+        schedule_interval = '@daily',
+        catchup=False) as dag:
+
+
+        is_weather_api_ready = HttpSensor(
+        task_id = 'is_weather_api_ready',
+        http_conn_id='weathermap_api',
+        endpoint='/data/2.5/weather?q=Houston&appid=xxxxxxxx'    
+        )
+```
+ * **Task 2** - This task calls the weather API and invokes a GET method to get the data in json format. We use a lambda function to convert the load into a text.
+```
+        extract_weather_data = SimpleHttpOperator(
+        task_id = 'extract_weather_data',
+        http_conn_id='weathermap_api',
+        endpoint='/data/2.5/weather?q=Houston&appid=7ca17c851237e628dcc5331cbfba9566',    
+        method = 'GET',
+        response_filter = lambda response: json.loads(response.text),
+        log_response= True
+        )
+```
+
+  * **Task 3** - This task calls a python function that transforms the json format into csv file and store it in AWS S3 buckets. You can define the schedule intervals in which you want to execute your DAG, based on default_args.
+```
+        transform_load_weather_data = PythonOperator(
+        task_id = 'transform_weather_data',
+        python_callable = transform_load_data
+        )
+```
+ After implementing above step, if we go over to Airflow UI, we can see the tasks inside DAG, the directed chain is achieved by adding tasks ordering at the end of the DAG.
+ <h4 align ='center' >   is_weather_api_available >> extract_weather_data >> transform_load_weather_data </h4>
+
+ ![Airflow DAG](https://github.com/srajeevan/AWS-Python_ETL_Pipeline_using_Airflow/blob/main/images/Airflow_Dag.png)
+
+ * **Step 4** - We can write the tranform function and give appropriate permissions to airflow for using AWS S3 and proper session credentials. For every transaction, AWS creates a session window that allows a service to interact with AWS components.
+```
+def transform_load_data(task_instance):
+    data = task_instance.xcom_pull(task_ids="extract_weather_data")
+    city = data["name"]
+    weather_description = data["weather"][0]['description']
+    temp_farenheit = kelvin_to_fahrenheit(data["main"]["temp"])
+    feels_like_farenheit= kelvin_to_fahrenheit(data["main"]["feels_like"])
+    min_temp_farenheit = kelvin_to_fahrenheit(data["main"]["temp_min"])
+    max_temp_farenheit = kelvin_to_fahrenheit(data["main"]["temp_max"])
+    pressure = data["main"]["pressure"]
+    humidity = data["main"]["humidity"]
+    wind_speed = data["wind"]["speed"]
+    time_of_record = datetime.utcfromtimestamp(data['dt'] + data['timezone'])
+    sunrise_time = datetime.utcfromtimestamp(data['sys']['sunrise'] + data['timezone'])
+    sunset_time = datetime.utcfromtimestamp(data['sys']['sunset'] + data['timezone'])
+
+    transformed_data = {"City": city,
+                        "Description": weather_description,
+                        "Temperature (F)": temp_farenheit,
+                        "Feels Like (F)": feels_like_farenheit,
+                        "Minimun Temp (F)":min_temp_farenheit,
+                        "Maximum Temp (F)": max_temp_farenheit,
+                        "Pressure": pressure,
+                        "Humidty": humidity,
+                        "Wind Speed": wind_speed,
+                        "Time of Record": time_of_record,
+                        "Sunrise (Local Time)":sunrise_time,
+                        "Sunset (Local Time)": sunset_time                        
+                        }
+    transformed_data_list = [transformed_data]
+    df_data = pd.DataFrame(transformed_data_list)
+    aws_credentials = {"key": "xxxxxx", "secret": "xxxxxx", "token": "xxxx"}
+
+    now = datetime.now()
+    dt_string = now.strftime("%d%m%Y%H%M%S")
+    dt_string = 'current_weather_data_houston_' + dt_string
+    df_data.to_csv(f"s3://houstonweatherdata/{dt_string}.csv", index=False, storage_options=aws_credentials)
+```
+
+* **Step 5** - Now, we can see that, we have csv files stored in AWS S3 buckets using data pipeline that we just created.
+
+ ![CSV files in S3 Location](https://github.com/srajeevan/AWS-Python_ETL_Pipeline_using_Airflow/blob/main/images/s3_bucket.png)
